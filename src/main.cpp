@@ -15,9 +15,11 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index) {
         // Example: "5:hello" -> "hello"
         size_t colon_index = encoded_value.find(':');
         if (colon_index != std::string::npos) {
-            std::string number_string = encoded_value.substr(0, colon_index);
+            std::string number_string =
+                encoded_value.substr(index, colon_index);
             int64_t number = std::atoll(number_string.c_str());
             std::string str = encoded_value.substr(colon_index + 1, number);
+            index = colon_index + number + 1;
             return json(str);
         } else {
             throw std::runtime_error("Invalid encoded value: " + encoded_value);
@@ -33,6 +35,17 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index) {
         index = end_index + 1;
         return json(number);
 
+    } else if (c == 'l') {
+        // might be a list `l<contents>e`
+        index++;  // skip `l`
+        json list = json::array();
+        char type = encoded_value[index];
+        while (type != 'e') {
+            list.push_back(decode_bencoded_value(encoded_value, index));
+            type = encoded_value[index];
+        }
+        index++;  // skip the list-ending 'e'
+        return list;
     } else {
         throw std::runtime_error("Unhandled encoded value: " + encoded_value);
     }
