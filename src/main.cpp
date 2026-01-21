@@ -1,8 +1,8 @@
+#include <cctype>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
-#include <cctype>
-#include <cstdlib>
 
 #include "lib/nlohmann/json.hpp"
 
@@ -31,7 +31,8 @@ int main(int argc, char* argv[]) {
     std::cerr << std::unitbuf;
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " decode <encoded_value>"
+                  << std::endl;
         return 1;
     }
 
@@ -39,16 +40,17 @@ int main(int argc, char* argv[]) {
 
     if (command == "decode") {
         if (argc < 3) {
-            std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
+            std::cerr << "Usage: " << argv[0] << " decode <encoded_value>"
+                      << std::endl;
             return 1;
         }
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
+        // You can use print statements as follows for debugging, they'll be
+        // visible when running tests.
         std::cerr << "Logs from your program will appear here!" << std::endl;
 
-        // TODO: Uncomment the code below to pass the first stage
-        // std::string encoded_value = argv[2];
-        // json decoded_value = decode_bencoded_value(encoded_value);
-        // std::cout << decoded_value.dump() << std::endl;
+        std::string encoded_value = argv[2];
+        json decoded_value = decode_bencoded_value(encoded_value);
+        std::cout << decoded_value.dump() << std::endl;
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;

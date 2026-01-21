@@ -19,7 +19,7 @@ cmake . -B build
 cmake --build build
 
 # Run
-./build/src/main
+./build/src/main decode <encoded_value>
 
 # Enable and run tests (GTest)
 cmake -DENABLE_TESTING=ON -B build
@@ -28,9 +28,6 @@ ctest --test-dir build
 
 # Run a single test
 ctest --test-dir build -R <test_name>
-
-# Test DNS server manually (while server is running)
-dig @127.0.0.1 -p 2053 example.com
 ```
 
 ## Development Environment
@@ -48,21 +45,10 @@ dig @127.0.0.1 -p 2053 example.com
 
 ## Architecture
 
-DNS server using UDP sockets on port 2053. Entry point is `src/main.cpp` which sets up a UDP socket, binds to the port, and runs an event loop receiving DNS queries and sending responses.
+BitTorrent client implementation. Entry point is `src/main.cpp` which provides a CLI interface.
 
-Socket configuration: SO_REUSEPORT enabled, 512-byte buffer (standard DNS max).
+### Current Implementation
 
-**Current behavior**: Returns hardcoded IP 8.8.8.8 for all A record queries.
-
-### DNS Message Structs
-
-All defined in `src/main.cpp`:
-
-- **DNSHeader**: 12-byte header with ID, flags, and section counts. Methods: `parse_from()`, `write_to()`, `create_response()`
-- **DNSQuestion**: Query section with domain name (QNAME), type (QTYPE), and class (QCLASS). Handles label encoding (length-prefixed segments)
-- **DNSAnswer**: Resource record with domain, type, class, TTL, and RDATA. Supports DNS compression (0xC00C pointer). Static factory: `create_a_record()`
-- **DNSCompressionTable**: Maps domain names to message offsets for pointer-based compression (RFC 1035 Section 4.1.4). Methods: `record_name()`, `find_pointer()`
-
-### DNS Message Format
-
-All DNS communications use a single message format with 5 sections: header (12 bytes, big-endian), question, answer, authority, and additional.
+- **Bencode decoding**: `decode_bencoded_value()` parses bencoded strings (length-prefixed format like `5:hello`)
+- **CLI**: Accepts `decode <value>` command to decode and output bencoded values as JSON
+- **JSON**: Uses nlohmann/json (vendored in `src/lib/nlohmann/json.hpp`) for JSON output
