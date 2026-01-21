@@ -1,6 +1,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -8,8 +9,9 @@
 
 using json = nlohmann::json;
 
-json decode_bencoded_value(const std::string& encoded_value) {
-    if (std::isdigit(encoded_value[0])) {
+json decode_bencoded_value(const std::string& encoded_value, size_t& index) {
+    char c = encoded_value[index];
+    if (std::isdigit(c)) {
         // Example: "5:hello" -> "hello"
         size_t colon_index = encoded_value.find(':');
         if (colon_index != std::string::npos) {
@@ -20,6 +22,17 @@ json decode_bencoded_value(const std::string& encoded_value) {
         } else {
             throw std::runtime_error("Invalid encoded value: " + encoded_value);
         }
+    } else if (c == 'i') {
+        // maybe an encoded integer
+        size_t end_index = encoded_value.find('e', index);
+        if (end_index == std::string::npos) {
+            throw std::runtime_error("Invalid encoded integer: missing 'e'");
+        }
+        int64_t number = std::atoll(
+            encoded_value.substr(index + 1, end_index - index - 1).c_str());
+        index = end_index + 1;
+        return json(number);
+
     } else {
         throw std::runtime_error("Unhandled encoded value: " + encoded_value);
     }
@@ -49,7 +62,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Logs from your program will appear here!" << std::endl;
 
         std::string encoded_value = argv[2];
-        json decoded_value = decode_bencoded_value(encoded_value);
+        size_t index = 0;
+        json decoded_value = decode_bencoded_value(encoded_value, index);
         std::cout << decoded_value.dump() << std::endl;
     } else {
         std::cerr << "unknown command: " << command << std::endl;
