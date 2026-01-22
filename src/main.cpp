@@ -13,10 +13,10 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index) {
     char c = encoded_value[index];
     if (std::isdigit(c)) {
         // Example: "5:hello" -> "hello"
-        size_t colon_index = encoded_value.find(':');
+        size_t colon_index = encoded_value.find(':', index);
         if (colon_index != std::string::npos) {
             std::string number_string =
-                encoded_value.substr(index, colon_index);
+                encoded_value.substr(index, colon_index - index);
             int64_t number = std::atoll(number_string.c_str());
             std::string str = encoded_value.substr(colon_index + 1, number);
             index = colon_index + number + 1;
@@ -46,6 +46,19 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index) {
         }
         index++;  // skip the list-ending 'e'
         return list;
+    } else if (c == 'd') {
+        // might be a dictionary
+        // {"hello": 52, "foo":"bar"}
+        // d3:foo3:bar5:helloi52ee
+        index++;  // skip 'd'
+        json dict = json::object();
+        while (encoded_value[index] != 'e') {
+            const json key = decode_bencoded_value(encoded_value, index);
+            const json value = decode_bencoded_value(encoded_value, index);
+            dict[key.get<std::string>()] = value;
+        }
+        index++;
+        return dict;
     } else {
         throw std::runtime_error("Unhandled encoded value: " + encoded_value);
     }
