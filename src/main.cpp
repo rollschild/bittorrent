@@ -1,6 +1,8 @@
 #include <cctype>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,7 +36,6 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index) {
             encoded_value.substr(index + 1, end_index - index - 1).c_str());
         index = end_index + 1;
         return json(number);
-
     } else if (c == 'l') {
         // might be a list `l<contents>e`
         index++;  // skip `l`
@@ -64,6 +65,16 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index) {
     }
 }
 
+std::string read_file(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary);  // binary?
+    if (!file) {
+        throw std::runtime_error("Could not open file: " + filename);
+    }
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    return ss.str();
+}
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -91,6 +102,21 @@ int main(int argc, char* argv[]) {
         size_t index = 0;
         json decoded_value = decode_bencoded_value(encoded_value, index);
         std::cout << decoded_value.dump() << std::endl;
+    } else if (command == "info") {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0] << " info <torrent_file>"
+                      << std::endl;
+            return 1;
+        }
+        std::string filename = argv[2];
+        std::string contents = read_file(filename);
+        size_t index = 0;
+        json torrent = decode_bencoded_value(contents, index);
+
+        std::cout << "Tracker URL: " << torrent["announce"].get<std::string>()
+                  << std::endl;
+        std::cout << "Length: " << torrent["info"]["length"].get<int64_t>()
+                  << std::endl;
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
