@@ -1,6 +1,9 @@
+#include <openssl/sha.h>
+
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -75,6 +78,37 @@ std::string read_file(const std::string& filename) {
     return ss.str();
 }
 
+/**
+ * Helper to find and extract raw bencoded value for a dictionary key
+ */
+std::string extract_bencoded_value(const std::string& data,
+                                   const std::string& key) {
+    // e.g. search for "4:info" in the raw torrent data
+    std::string bencoded_key = std::to_string(key.length()) + ":" + key;
+    // search in raw data
+    size_t key_pos = data.find(bencoded_key);
+    if (key_pos == std::string::npos) {
+        throw std::runtime_error("Key not found: " + key);
+    }
+    // position after "4:info"
+    size_t value_start = key_pos + bencoded_key.length();
+    size_t index = value_start;
+    decode_bencoded_value(data, index);  // advances index past the value
+    return data.substr(value_start, index - value_start);
+}
+
+std::string sha1_hash(const std::string& data) {
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    SHA1(reinterpret_cast<const unsigned char*>(data.c_str()), data.length(),
+         hash);
+    std::ostringstream ss;
+    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i) {
+        ss << std::hex << std::setfill('0') << std::setw(2)
+           << static_cast<int>(hash[i]);
+    }
+    return ss.str();
+}
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -110,6 +144,7 @@ int main(int argc, char* argv[]) {
         }
         std::string filename = argv[2];
         std::string contents = read_file(filename);
+        std::string info_bencoded = extract_bencoded_value(contents, "info");
         size_t index = 0;
         json torrent = decode_bencoded_value(contents, index);
 
@@ -117,6 +152,7 @@ int main(int argc, char* argv[]) {
                   << std::endl;
         std::cout << "Length: " << torrent["info"]["length"].get<int64_t>()
                   << std::endl;
+        std::cout << "Info Hash: " << sha1_hash(info_bencoded) << std::endl;
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;

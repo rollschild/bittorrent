@@ -55,6 +55,7 @@
               # llvm.libcxx
               # zlib
               # liburing
+              openssl
             ];
 
             CXXFLAGS = "-Wall -Wfatal-errors -std=c++23";
