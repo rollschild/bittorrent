@@ -153,6 +153,24 @@ int main(int argc, char* argv[]) {
         std::cout << "Length: " << torrent["info"]["length"].get<int64_t>()
                   << std::endl;
         std::cout << "Info Hash: " << sha1_hash(info_bencoded) << std::endl;
+        std::cout << "Piece Length: "
+                  << torrent["info"]["piece length"].get<int64_t>()
+                  << std::endl;
+        std::cout << "Pieces:" << std::endl;
+        std::string pieces = torrent["info"]["pieces"].get<std::string>();
+        for (size_t i = 0; i < pieces.length(); i += 20) {
+            std::ostringstream ss;
+            for (size_t j = 0; j < 20; ++j) {
+                ss << std::hex << std::setfill('0')
+                   << std::setw(2)
+                   // inner `static_cast` prevents sign extension
+                   // e.g. 0xAB is -85 for signed char
+                   // outer `static_cast` prints 0xAB as a number, not a char
+                   << static_cast<int>(
+                          static_cast<unsigned char>(pieces[i + j]));
+            }
+            std::cout << ss.str() << std::endl;
+        }
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
