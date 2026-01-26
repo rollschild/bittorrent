@@ -1,5 +1,9 @@
+#include <arpa/inet.h>
 #include <curl/curl.h>
+#include <netinet/in.h>
 #include <openssl/sha.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <cctype>
 #include <cstdint>
@@ -175,6 +179,60 @@ std::string fetch_url(const std::string& url) {
     return response;
 }
 
+std::string perform_handshake(const std::string& ip, int port,
+                              const std::string& info_hash,
+                              const std::string& peer_id) {
+    // create socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        throw std::runtime_error("Failed to create socket!");
+    }
+
+    // connect to peer
+    struct sockaddr_in peer_addr{};
+    peer_addr.sin_family = AF_INET;
+    peer_addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &peer_addr.sin_addr);
+
+    if (connect(sock, reinterpret_cast<sockaddr*>(&peer_addr),
+                sizeof(peer_addr)) < 0) {
+        close(sock);
+        throw std::runtime_error("Failed to connect to peer!");
+    }
+
+    // build handshake message
+    std::string handshake;
+    handshake += static_cast<char>(19);  // protocl len
+    handshake += "BitTorrent protocol";  // 19 bytes
+    handshake += std::string(8, '\0');   // reserved bytes
+    handshake += info_hash;              // 20 bytes
+    handshake += peer_id;                // 20 bytes
+
+    // send handshake
+    if (send(sock, handshake.c_str(), handshake.length(), 0) !=
+        static_cast<ssize_t>(handshake.length())) {
+        close(sock);
+        throw std::runtime_error("Failed to send handshake!");
+    }
+
+    // receive peer's handshake (68 bytes)
+    char response[68];
+    size_t total_recvd = 0;
+    while (total_recvd < 68) {
+        ssize_t recvd = recv(sock, response + total_recvd, 68 - total_recvd, 0);
+        if (recvd < 0) {
+            close(sock);
+            throw std::runtime_error("Failed to receive handshake!");
+        }
+        total_recvd += recvd;
+    }
+
+    close(sock);
+
+    // extract peer ID
+    return std::string(response + 48, 20);
+}
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -280,6 +338,43 @@ int main(int argc, char* argv[]) {
                       << port << std::endl;
         }
 
+    } else if (command == "handshake") {
+        if (argc < 4) {
+            std::cerr << "Usage: " << argv[0]
+                      << " handshake <torrent_file> <peer_ip>:<peer_port>"
+                      << std::endl;
+            return 1;
+        }
+
+        std::string filename = argv[2];
+        std::string peer_addr = argv[3];
+
+        // parse peer address
+        size_t colon_pos = peer_addr.find(':');
+        if (colon_pos == std::string::npos) {
+            std::cerr << "Invalid peer address format" << std::endl;
+            return 1;
+        }
+
+        std::string ip = peer_addr.substr(0, colon_pos);
+        int port = std::stoi(peer_addr.substr(colon_pos + 1));
+
+        // get info hash from content
+        std::string contents = read_file(filename);
+        std::string info_bencoded = extract_bencoded_value(contents, "info");
+        std::string info_hash_raw = sha1_hash_raw(info_bencoded);  // why raw?
+        std::string peer_id = "00112233445566778899";
+
+        // perform handshake
+        std::string rcvd_peer_id =
+            perform_handshake(ip, port, info_hash_raw, peer_id);
+
+        std::cout << "Peer ID: ";
+        for (unsigned char c : rcvd_peer_id) {
+            std::cout << std::hex << std::setfill('0') << std::setw(2)
+                      << static_cast<int>(c);
+        }
+        std::cout << std::endl;
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
