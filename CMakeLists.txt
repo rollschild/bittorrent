@@ -72,6 +72,7 @@ set(${PROJECT_NAME}_INSTALL_CMAKEDIR
 # Dependencies  ##
 # ##############################################################################
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 
 if(ENABLE_TESTING)
   find_package(GTest REQUIRED)

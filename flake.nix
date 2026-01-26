@@ -56,6 +56,7 @@
               # zlib
               # liburing
               openssl
+              curl
             ];
 
             CXXFLAGS = "-Wall -Wfatal-errors -std=c++23";

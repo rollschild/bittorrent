@@ -1,9 +1,12 @@
+#include <curl/curl.h>
 #include <openssl/sha.h>
 
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <ios>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -109,6 +112,69 @@ std::string sha1_hash(const std::string& data) {
     return ss.str();
 }
 
+/**
+ * Get SHA1 hash (binary, not hex)
+ */
+std::string sha1_hash_raw(const std::string& data) {
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    SHA1(reinterpret_cast<const unsigned char*>(data.c_str()), data.length(),
+         hash);
+    return std::string(reinterpret_cast<char*>(hash), SHA_DIGEST_LENGTH);
+}
+
+/**
+ * Callback for curl to write response data
+ *   nmemb: number of elements received
+ *   size: size of each element (always 1 for bytes)
+ */
+size_t write_callback(void* contents, size_t size, size_t nmemb,
+                      std::string* output) {
+    size_t total_size = size * nmemb;
+    output->append(static_cast<char*>(contents), total_size);
+    return total_size;
+}
+
+/**
+ * URL-encode binary data (for info_hash)
+ */
+std::string url_encode(const std::string& data) {
+    std::ostringstream encoded;
+    // std::uppercase flag set in order to follow RFC 3986 convetion
+    // percent-encodings use uppercase hex digits
+    encoded << std::hex << std::uppercase;
+    for (unsigned char c : data) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded << c;
+        } else {
+            encoded << '%' << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(c);
+        }
+    }
+    return encoded.str();
+}
+
+std::string fetch_url(const std::string& url) {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        throw std::runtime_error("Failed to initialize curl!");
+    }
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        throw std::runtime_error("Curl request failed: " +
+                                 std::string(curl_easy_strerror(res)));
+    }
+
+    return response;
+}
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -171,6 +237,49 @@ int main(int argc, char* argv[]) {
             }
             std::cout << ss.str() << std::endl;
         }
+    } else if (command == "peers") {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0] << " peers <torrent_file>"
+                      << std::endl;
+            return 1;
+        }
+
+        std::string filename = argv[2];
+        std::string contents = read_file(filename);
+        size_t index = 0;
+        json torrent = decode_bencoded_value(contents, index);
+
+        std::string info_bencoded = extract_bencoded_value(contents, "info");
+        std::string info_hash_raw = sha1_hash_raw(info_bencoded);
+
+        std::string tracker_url = torrent["announce"].get<std::string>();
+        int64_t length = torrent["info"]["length"].get<int64_t>();
+
+        // build tracker request URL
+        std::string peer_id = "00112233445566778899";  // 20-byte peer ID
+        std::string url =
+            tracker_url + "?info_hash=" + url_encode(info_hash_raw) +
+            "&peer_id=" + peer_id + "&port=6881" + "&uploaded=0" +
+            "&downloaded=0" + "&left=" + std::to_string(length) + "&compact=1";
+
+        std::string res = fetch_url(url);
+        index = 0;
+        json tracker_res = decode_bencoded_value(res, index);
+
+        // parse compact peers (6 bytes each: 4 IP + 2 port)
+        std::string peers = tracker_res["peers"].get<std::string>();
+        for (size_t i = 0; i < peers.length(); i += 6) {
+            int ip1 = static_cast<unsigned char>(peers[i]);
+            int ip2 = static_cast<unsigned char>(peers[i + 1]);
+            int ip3 = static_cast<unsigned char>(peers[i + 2]);
+            int ip4 = static_cast<unsigned char>(peers[i + 3]);
+            int port = (static_cast<unsigned char>(peers[i + 4]) << 8 |
+                        static_cast<unsigned char>(peers[i + 5]));
+
+            std::cout << ip1 << "." << ip2 << "." << ip3 << "." << ip4 << ":"
+                      << port << std::endl;
+        }
+
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
