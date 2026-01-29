@@ -1,0 +1,196 @@
+Piece Download Logic Explanation
+=================================
+
+High-Level Flow
+---------------
+
+Downloading a piece involves these stages:
+
+1. Parse the torrent metadata to learn piece sizes and hashes
+2. Connect to a peer (handshake)
+3. Exchange protocol messages (bitfield -> interested -> unchoke)
+4. Request the piece in blocks (16 KB chunks)
+5. Reassemble blocks and verify with SHA1
+
+
+Stage 1: Setup (download_piece command, lines 568-621)
+------------------------------------------------------
+
+  torrent file -> parse -> compute info hash -> contact tracker -> get peer -> handshake
+
+The torrent file is parsed to extract:
+
+  - total_len: total file size in bytes
+  - piece_len: the nominal size of each piece (e.g. 256 KB)
+  - num_pieces: ceil(total_len / piece_len) -- computed with the integer ceiling
+    trick (total_len + piece_len - 1) / piece_len
+  - this_piece_len: the actual size of the requested piece. All pieces are
+    piece_len except the last one, which is total_len - (piece_index * piece_len)
+    (the remainder).
+  - piece_hash: the expected SHA1 hash for this piece, extracted from the "pieces"
+    field (a concatenation of 20-byte SHA1 hashes, one per piece). The hash for
+    piece i lives at byte offset i * 20.
+
+get_first_peer() contacts the tracker with the info hash and gets back the first
+peer's IP and port from the compact peer list.
+
+perform_handshake() opens a TCP socket, sends the 68-byte BitTorrent handshake,
+receives the peer's handshake response, and returns the open socket (because
+keep_open = true).
+
+
+Stage 2: Protocol Negotiation (download_piece(), lines 294-365)
+---------------------------------------------------------------
+
+After the handshake, the peer wire protocol begins. All messages follow the format:
+
+  [4 bytes: length prefix (big-endian)] [1 byte: message ID] [payload...]
+
+The length prefix includes the ID byte but not itself, hence
+len = 1 + payload.size() at line 268.
+
+Step 2a: Receive Bitfield (line 297)
+
+  auto [bf_id, bf_payload] = recv_message(sock);
+
+The peer immediately sends a bitfield message (ID 5). This is a bitmap where each
+bit represents whether the peer has a given piece. The code receives it but doesn't
+inspect it -- it assumes the peer has the piece you want.
+
+Step 2b: Send Interested (line 299)
+
+  send_message(sock, MSG_INTERESTED);
+
+You tell the peer "I want data from you." This is a zero-payload message.
+
+Step 2c: Wait for Unchoke (lines 301-306)
+
+  while (true) {
+      auto [id, payload] = recv_message(sock);
+      if (id == MSG_UNCHOKE) break;
+  }
+
+By default, you are choked -- the peer won't serve you data. You loop, discarding
+messages, until you receive an unchoke (ID 1). Only then can you start requesting
+blocks.
+
+
+Stage 3: Block Requests (lines 309-336)
+----------------------------------------
+
+A piece is too large to request in one message. It's split into blocks of
+BLOCK_SIZE = 16384 bytes (16 KB), the standard block size in BitTorrent.
+
+Block count calculation (line 311):
+
+  int num_blocks = (piece_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+This is the integer ceiling division pattern: ceil(a / b) == (a + b - 1) / b.
+For example, a 262144-byte piece (256 KB) yields 16 blocks. A piece of 262145
+bytes yields 17 blocks (the last one is only 1 byte).
+
+Sending request messages (lines 314-336):
+
+For each block i:
+
+  - offset = i * BLOCK_SIZE -- where this block starts within the piece
+  - block_len = min(BLOCK_SIZE, piece_len - offset) -- handles the last block
+    which may be shorter
+
+Each request message (ID 6) has a 12-byte payload:
+
+  Field   Size      Value
+  -----   -------   --------------------------------
+  index   4 bytes   piece index (big-endian)
+  begin   4 bytes   byte offset within piece (big-endian)
+  length  4 bytes   block length (big-endian)
+
+All values are converted to network byte order (big-endian) with htonl() before
+being packed into the payload with memcpy.
+
+All requests are sent up front before waiting for any responses. This is a form
+of pipelining -- it avoids a round-trip per block.
+
+
+Stage 4: Receiving Blocks (lines 339-356)
+-----------------------------------------
+
+  int blocks_recvd = 0;
+  while (blocks_recvd < num_blocks) {
+      auto [id, payload] = recv_message(sock);
+      if (id == MSG_PIECE) {
+          uint32_t begin = ntohl(*reinterpret_cast<const uint32_t*>(payload.data() + 4));
+          std::memcpy(piece_data.data() + begin, payload.data() + 8, payload.size() - 8);
+          blocks_recvd++;
+      }
+  }
+
+Each piece message (ID 7) has this payload layout:
+
+  Field   Offset   Size       Description
+  -----   ------   --------   -------------------------
+  index   0        4 bytes    piece index
+  begin   4        4 bytes    byte offset within piece
+  block   8        variable   the actual data
+
+The code:
+1. Extracts "begin" from bytes 4-7 (converting from big-endian with ntohl)
+2. Copies the block data (payload.data() + 8, length payload.size() - 8) into
+   piece_data at offset "begin"
+
+This means blocks can arrive out of order and they'll still land in the correct
+position in piece_data because each block carries its own "begin" offset.
+
+Regarding the TODO comments in the code:
+
+  - "why const uint32_t*?" (line 350): The payload is a std::string (byte buffer).
+    To read 4 bytes as a uint32_t, you need to reinterpret the raw bytes as a
+    pointer to uint32_t. It's const because payload.data() returns const char* --
+    you're reading, not writing.
+
+  - "why minus one?" (line 289 in recv_message): The length prefix includes the
+    1-byte message ID. After reading the ID separately, the remaining payload is
+    len - 1 bytes.
+
+  - "why +1?" (line 268 in send_message): Same reason -- the length prefix must
+    account for the ID byte plus the payload.
+
+
+Stage 5: Hash Verification (lines 358-363)
+-------------------------------------------
+
+  std::string computed_hash = sha1_hash_raw(piece_data);
+  if (computed_hash != piece_hash) {
+      throw std::runtime_error("Piece hash mismatch!");
+  }
+
+After reassembling all blocks, the complete piece is SHA1-hashed and compared
+against the expected hash from the torrent file. If they don't match, the data is
+corrupt and the piece is rejected. This is how BitTorrent guarantees data
+integrity -- every piece is independently verifiable.
+
+
+Summary Diagram
+---------------
+
+  Torrent File
+    |-- piece length: 262144 (256 KB)
+    |-- total length: 1000000
+    |-- pieces: [hash0][hash1][hash2][hash3]  (4 x 20 bytes)
+    +-- announce: tracker URL
+
+  Piece 0 (256 KB) -> 16 blocks of 16 KB each
+    Block 0:  offset=0,      len=16384
+    Block 1:  offset=16384,  len=16384
+    ...
+    Block 15: offset=245760, len=16384
+
+  Piece 3 (last, 225536 bytes) -> 14 blocks
+    Block 0-13: offset=0..212992, len=16384
+    Block 13:   offset=212992,    len=12544  <- shorter last block
+
+  Wire protocol:
+    [handshake] -> [bitfield] -> [interested] -> [unchoke]
+    -> [request block 0] [request block 1] ... [request block N]
+    <- [piece block 0] [piece block 1] ... [piece block N]
+    -> SHA1(reassembled) == expected_hash? check

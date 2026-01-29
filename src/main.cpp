@@ -5,9 +5,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <ios>
@@ -15,9 +17,22 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "lib/nlohmann/json.hpp"
+
+// Message IDs
+// corresponds to https://www.bittorrent.org/beps/bep_0003.html#peer-messages
+constexpr uint8_t MSG_CHOKE = 0;
+constexpr uint8_t MSG_UNCHOKE = 1;
+constexpr uint8_t MSG_INTERESTED = 2;
+constexpr uint8_t MSG_NOT_INTERESTED = 3;
+constexpr uint8_t MSG_BITFIELD = 5;
+constexpr uint8_t MSG_REQUEST = 6;
+constexpr uint8_t MSG_PIECE = 7;
+
+constexpr size_t BLOCK_SIZE = 16384;  // 2^14, 16KB
 
 using json = nlohmann::json;
 
@@ -118,6 +133,13 @@ std::string sha1_hash(const std::string& data) {
 
 /**
  * Get SHA1 hash (binary, not hex)
+ *   - Raw binary (20 bytes): each byte can be any value 0 - 255, including
+ * non-printable chars and null bytes
+ *     -
+ * \xd6\x9f\x91\xe6\xb2\xae\x4c\x54\x24\x68\xd1\x07\x3a\x71\xd4\xea\x13\x87\x9a\x7f
+ *   - Hex string (40 characters): each byte represented as two hex digits (0-9,
+ * a-f)
+ *     - d69f91e6b2ae4c542468d1073a71d4ea13879a7f
  */
 std::string sha1_hash_raw(const std::string& data) {
     unsigned char hash[SHA_DIGEST_LENGTH];
@@ -179,9 +201,21 @@ std::string fetch_url(const std::string& url) {
     return response;
 }
 
-std::string perform_handshake(const std::string& ip, int port,
-                              const std::string& info_hash,
-                              const std::string& peer_id) {
+void recv_all(int sock, void* buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t recvd =
+            recv(sock, static_cast<char*>(buf) + total, len - total, 0);
+        if (recvd <= 0) {
+            throw std::runtime_error("Connection closed or error during recv!");
+        }
+        total += recvd;
+    }
+}
+
+int perform_handshake(const std::string& ip, int port,
+                      const std::string& info_hash, const std::string& peer_id,
+                      bool keep_open = false) {
     // create socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -192,6 +226,8 @@ std::string perform_handshake(const std::string& ip, int port,
     struct sockaddr_in peer_addr{};
     peer_addr.sin_family = AF_INET;
     peer_addr.sin_port = htons(port);
+    // internet representation to network
+    // converts IP address from human-readable string to binary network format
     inet_pton(AF_INET, ip.c_str(), &peer_addr.sin_addr);
 
     if (connect(sock, reinterpret_cast<sockaddr*>(&peer_addr),
@@ -217,20 +253,155 @@ std::string perform_handshake(const std::string& ip, int port,
 
     // receive peer's handshake (68 bytes)
     char response[68];
-    size_t total_recvd = 0;
-    while (total_recvd < 68) {
-        ssize_t recvd = recv(sock, response + total_recvd, 68 - total_recvd, 0);
-        if (recvd < 0) {
-            close(sock);
-            throw std::runtime_error("Failed to receive handshake!");
-        }
-        total_recvd += recvd;
+    recv_all(sock, response, 68);
+
+    if (!keep_open) {
+        close(sock);
     }
 
-    close(sock);
-
     // extract peer ID
-    return std::string(response + 48, 20);
+    // return std::string(response + 48, 20);
+    return sock;
+}
+
+void send_message(int sock, uint8_t id, const std::string& payload = "") {
+    // the length prefix includes the ID byte but _NOT_ itself
+    // len = 1 + payload.size()
+    uint32_t len = htonl(1 + payload.size());
+    send(sock, &len, 4, 0);  // message length prefix (4 bytes)
+    send(sock, &id, 1, 0);   // message id (1 byte)
+    if (!payload.empty()) {
+        send(sock, payload.c_str(), payload.size(), 0);
+    }
+}
+std::pair<uint8_t, std::string> recv_message(int sock) {
+    uint32_t len;
+    // first, the length-prefix (4 bytes)
+    recv_all(sock, &len, 4);
+    len = ntohl(len);
+    if (len == 0) {
+        return {255, ""};  // keep-alive
+    }
+
+    // then, the ID byte
+    uint8_t id;
+    recv_all(sock, &id, 1);
+
+    std::string payload(len - 1, '\0');
+    if (len > 1) {
+        recv_all(sock, payload.data(), len - 1);
+    }
+
+    return {id, payload};
+}
+
+std::string download_piece(int sock, int piece_index, int piece_len,
+                           const std::string& piece_hash) {
+    // wait for bitfield
+    auto [bf_id, bf_payload] = recv_message(sock);
+    // send interested
+    send_message(sock, MSG_INTERESTED);
+    // wait for unchoke
+    while (true) {
+        auto [id, payload] = recv_message(sock);
+        if (id == MSG_UNCHOKE) {
+            break;
+        }
+    }
+
+    // request all blocks
+    std::string piece_data(piece_len, '\0');
+    // REMEMBER this
+    int num_blocks = (piece_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // a piece is too large to request in one message
+    for (int i = 0; i < num_blocks; ++i) {
+        int offset = i * BLOCK_SIZE;
+        // to handle the last block where the actual size is smaller than
+        // BLOCK_SIZE
+        int block_len =
+            std::min(static_cast<int>(BLOCK_SIZE), piece_len - offset);
+
+        // request message format:
+        //   - index: 4 bytes
+        //   - begin (byte offset within piece): 4 bytes
+        //   - length: 4 bytes
+        std::string req_payload(12, '\0');
+        // 32-bit unsigned -> network byte BIG endian
+        uint32_t idx = htonl(piece_index);
+        uint32_t begin = htonl(offset);
+        uint32_t len = htonl(block_len);
+
+        std::memcpy(req_payload.data(), &idx, 4);
+        std::memcpy(req_payload.data() + 4, &begin, 4);
+        std::memcpy(req_payload.data() + 8, &len, 4);
+
+        // All requests are sent up front before waiting for any responses.
+        // This is a form of **pipelining** -- it avoids a round-trip per block.
+        send_message(sock, MSG_REQUEST, req_payload);
+    }
+
+    // receive all blocks
+    int blocks_recvd = 0;
+    while (blocks_recvd < num_blocks) {
+        auto [id, payload] = recv_message(sock);
+        if (id == MSG_PIECE) {
+            // format:
+            //   - id
+            //   - payload
+            //     - index (4 bytes)
+            //     - begin (4 bytes)
+            //     - block (variable, at offset 8)
+
+            // payload is std::string
+            // to read 4 bytes at `uint32_t`, we need to reinterpret the raw
+            // bytes as a pointer to uint32_t
+            // payload.data() is char*
+            // reinterpret_cast works with pointers _ONLY_
+            // then dereference uint32_t* to uint32_t
+            uint32_t begin =
+                ntohl(*reinterpret_cast<const uint32_t*>(payload.data() + 4));
+            std::memcpy(piece_data.data() + begin, payload.data() + 8,
+                        payload.size() - 8);
+            blocks_recvd++;
+        }
+    }
+
+    // verify hash
+    std::string computed_hash = sha1_hash_raw(piece_data);
+    if (computed_hash != piece_hash) {
+        throw std::runtime_error("Piece hash mismatch!");
+    }
+
+    return piece_data;
+}
+
+std::pair<std::string, int> get_first_peer(const json& torrent,
+                                           const std::string& info_hash_raw) {
+    std::string tracker_url = torrent["announce"].get<std::string>();
+    int64_t len = torrent["info"]["length"].get<int64_t>();
+    std::string peer_id = "00112233445566778899";
+
+    std::string url = tracker_url + "?info_hash=" + url_encode(info_hash_raw) +
+                      "&peer_id=" + peer_id + "&port=6881" + "&uploaded=0" +
+                      "&downloaded=0" + "&left=" + std::to_string(len) +
+                      "&compact=1";
+
+    std::string res = fetch_url(url);
+    size_t idx = 0;
+    json tracker_res = decode_bencoded_value(res, idx);
+    // parse compact peers (6 bytes each: 4 IP + 2 port)
+    std::string peers = tracker_res["peers"].get<std::string>();
+    int ip1 = static_cast<unsigned char>(peers[0]);
+    int ip2 = static_cast<unsigned char>(peers[1]);
+    int ip3 = static_cast<unsigned char>(peers[2]);
+    int ip4 = static_cast<unsigned char>(peers[3]);
+    int port = (static_cast<unsigned char>(peers[4]) << 8 |
+                static_cast<unsigned char>(peers[5]));
+
+    std::string ip = std::to_string(ip1) + "." + std::to_string(ip2) + "." +
+                     std::to_string(ip3) + "." + std::to_string(ip4);
+    return {ip, port};
 }
 
 int main(int argc, char* argv[]) {
@@ -362,12 +533,43 @@ int main(int argc, char* argv[]) {
         // get info hash from content
         std::string contents = read_file(filename);
         std::string info_bencoded = extract_bencoded_value(contents, "info");
-        std::string info_hash_raw = sha1_hash_raw(info_bencoded);  // why raw?
+        std::string info_hash_raw = sha1_hash_raw(info_bencoded);
         std::string peer_id = "00112233445566778899";
 
         // perform handshake
-        std::string rcvd_peer_id =
-            perform_handshake(ip, port, info_hash_raw, peer_id);
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            throw std::runtime_error("Failed to create socket!");
+        }
+
+        struct sockaddr_in peer_addr_struct{};
+        peer_addr_struct.sin_family = AF_INET;
+        peer_addr_struct.sin_port = htons(port);
+        inet_pton(AF_INET, ip.c_str(), &peer_addr_struct.sin_addr);
+        if (connect(sock, reinterpret_cast<sockaddr*>(&peer_addr_struct),
+                    sizeof(peer_addr_struct)) < 0) {
+            close(sock);
+            throw std::runtime_error("Fialed to connect to peer!");
+        }
+
+        std::string handshake;
+        handshake += static_cast<char>(19);  // protocl len
+        handshake += "BitTorrent protocol";  // 19 bytes
+        handshake += std::string(8, '\0');   // reserved bytes
+        handshake += info_hash_raw;          // 20 bytes
+        handshake += peer_id;                // 20 bytes
+
+        if (send(sock, handshake.c_str(), handshake.length(), 0) !=
+            static_cast<ssize_t>(handshake.length())) {
+            close(sock);
+            throw std::runtime_error("Failed to send handshake!");
+        }
+
+        char response[68];
+        recv_all(sock, response, 68);
+        close(sock);
+
+        std::string rcvd_peer_id(response + 48, 20);
 
         std::cout << "Peer ID: ";
         for (unsigned char c : rcvd_peer_id) {
@@ -375,6 +577,65 @@ int main(int argc, char* argv[]) {
                       << static_cast<int>(c);
         }
         std::cout << std::endl;
+    } else if (command == "download_piece") {
+        if (argc < 6 || std::string(argv[2]) != "-o") {
+            std::cerr << "Usage: " << argv[0]
+                      << " download_piece -o <output_path> <torrent_file> "
+                         "<piece_index>"
+                      << std::endl;
+            return 1;
+        }
+
+        std::string output_path = argv[3];
+        std::string filename = argv[4];
+        int piece_index = std::stoi(argv[5]);
+
+        // parse torrent
+        std::string contents = read_file(filename);
+        size_t index = 0;
+        json torrent = decode_bencoded_value(contents, index);
+
+        std::string info_bencoded = extract_bencoded_value(contents, "info");
+        std::string info_hash_raw = sha1_hash_raw(info_bencoded);
+
+        // calculate piece length
+        int64_t total_len = torrent["info"]["length"].get<int64_t>();
+        int64_t piece_len = torrent["info"]["piece length"].get<int64_t>();
+        int num_pieces = (total_len + piece_len - 1) / piece_len;
+
+        // last piece may be smaller
+        // so `this_piece_len` <= piece_len
+        int this_piece_len = piece_len;
+        if (piece_index == num_pieces - 1) {
+            this_piece_len = total_len - (piece_index * piece_len);
+        }
+
+        // get piece hash (20 bytes per piece)
+        // `pieces` is an entire string of multiple hashes
+        std::string pieces = torrent["info"]["pieces"].get<std::string>();
+        std::string piece_hash = pieces.substr(piece_index * 20, 20);
+
+        // get peer and connect
+        auto [ip, port] = get_first_peer(torrent, info_hash_raw);
+        std::string peer_id = "00112233445566778899";
+
+        // 1. handshake
+        // 2. download data
+        int sock = perform_handshake(ip, port, info_hash_raw, peer_id, true);
+
+        // download piece
+        std::string piece_data =
+            download_piece(sock, piece_index, this_piece_len, piece_hash);
+        close(sock);
+
+        // write to file
+        std::ofstream out(output_path, std::ios::binary);
+        out.write(piece_data.c_str(), piece_data.size());
+        out.close();
+
+        std::cout << "Piece " << piece_index << " downloaded to " << output_path
+                  << "." << std::endl;
+
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;

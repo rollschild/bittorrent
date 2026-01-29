@@ -45,16 +45,27 @@ clang-format -i src/*.cpp
 - Compiler: GCC
 - Flags: `-Wall -Wfatal-errors -Wextra -Werror -g -O1`
 
+## Dependencies
+
+- **OpenSSL**: SHA1 hashing for info hash computation
+- **libcurl**: HTTP requests to tracker
+- **nlohmann/json**: JSON serialization (vendored in `src/lib/nlohmann/json.hpp`)
+
 ## Architecture
 
-BitTorrent client implementation. Entry point is `src/main.cpp` which provides a CLI interface.
+BitTorrent client implementation. Single-file architecture in `src/main.cpp` with CLI interface.
 
-### Current Implementation
+### CLI Commands
 
-- **Bencode decoding**: `decode_bencoded_value()` in `src/main.cpp` recursively parses all bencode types:
-  - Strings: length-prefixed format (e.g., `5:hello`)
-  - Integers: `i<number>e` format (e.g., `i52e`)
-  - Lists: `l<contents>e` format (e.g., `l5:helloi52ee`)
-  - Dictionaries: `d<key><value>...e` format (e.g., `d3:foo3:bare`)
-- **CLI**: Accepts `decode <value>` command to decode and output bencoded values as JSON
-- **JSON**: Uses nlohmann/json (vendored in `src/lib/nlohmann/json.hpp`)
+- `decode <value>` - Decode bencoded value to JSON
+- `info <torrent_file>` - Display torrent metadata (tracker URL, length, info hash, pieces)
+- `peers <torrent_file>` - Fetch and display peer list from tracker
+- `handshake <torrent_file> <ip>:<port>` - Perform BitTorrent handshake with a peer
+
+### Key Functions
+
+- `decode_bencoded_value()` - Recursive bencode parser (strings, integers, lists, dicts)
+- `extract_bencoded_value()` - Extract raw bencoded data for a dictionary key (used for info hash)
+- `sha1_hash()` / `sha1_hash_raw()` - SHA1 hashing (hex string vs raw bytes)
+- `fetch_url()` - HTTP GET using libcurl
+- `perform_handshake()` - TCP socket connection and BitTorrent protocol handshake
