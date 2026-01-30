@@ -295,8 +295,7 @@ std::pair<uint8_t, std::string> recv_message(int sock) {
     return {id, payload};
 }
 
-std::string download_piece(int sock, int piece_index, int piece_len,
-                           const std::string& piece_hash) {
+void wait_for_unchoke(int sock) {
     // wait for bitfield
     auto [bf_id, bf_payload] = recv_message(sock);
     // send interested
@@ -308,7 +307,10 @@ std::string download_piece(int sock, int piece_index, int piece_len,
             break;
         }
     }
+}
 
+std::string download_piece(int sock, int piece_index, int piece_len,
+                           const std::string& piece_hash) {
     // request all blocks
     std::string piece_data(piece_len, '\0');
     // REMEMBER this
@@ -623,6 +625,8 @@ int main(int argc, char* argv[]) {
         // 2. download data
         int sock = perform_handshake(ip, port, info_hash_raw, peer_id, true);
 
+        wait_for_unchoke(sock);
+
         // download piece
         std::string piece_data =
             download_piece(sock, piece_index, this_piece_len, piece_hash);
@@ -636,6 +640,59 @@ int main(int argc, char* argv[]) {
         std::cout << "Piece " << piece_index << " downloaded to " << output_path
                   << "." << std::endl;
 
+    } else if (command == "download") {
+        if (argc < 5 || std::string(argv[2]) != "-o") {
+            std::cerr << "Usage: " << argv[0]
+                      << " download -o <output_path> <torrent_file>"
+                      << std::endl;
+            return 1;
+        }
+
+        std::string output_path = argv[3];
+        std::string filename = argv[4];
+
+        std::string contents = read_file(filename);
+        size_t index = 0;
+        json torrent = decode_bencoded_value(contents, index);
+
+        std::string info_bencoded = extract_bencoded_value(contents, "info");
+        std::string info_hash_raw = sha1_hash_raw(info_bencoded);
+
+        int64_t total_len = torrent["info"]["length"].get<int64_t>();
+        int64_t piece_len = torrent["info"]["piece length"].get<int64_t>();
+        int num_pieces = (total_len + piece_len - 1) / piece_len;
+        std::string pieces = torrent["info"]["pieces"].get<std::string>();
+
+        // connect to peer
+        auto [ip, port] = get_first_peer(torrent, info_hash_raw);
+        std::string peer_id = "00112233445566778899";
+        int sock = perform_handshake(ip, port, info_hash_raw, peer_id, true);
+        wait_for_unchoke(sock);
+
+        // download all pieces
+        std::string file_data;
+        file_data.reserve(total_len);
+
+        for (int i = 0; i < num_pieces; ++i) {
+            int this_piece_len = (i == num_pieces - 1)
+                                     ? (total_len - (i * piece_len))
+                                     : piece_len;
+
+            // get piece hash
+            std::string piece_hash = pieces.substr(i * 20, 20);
+
+            // download piece
+            std::string piece_data =
+                download_piece(sock, i, this_piece_len, piece_hash);
+            file_data += piece_data;
+        }
+
+        close(sock);
+
+        // write complete file
+        std::ofstream out(output_path, std::ios::binary);
+        out.write(file_data.c_str(), file_data.size());
+        out.close();
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;

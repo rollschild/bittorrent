@@ -61,6 +61,7 @@ BitTorrent client implementation. Single-file architecture in `src/main.cpp` wit
 - `info <torrent_file>` - Display torrent metadata (tracker URL, length, info hash, pieces)
 - `peers <torrent_file>` - Fetch and display peer list from tracker
 - `handshake <torrent_file> <ip>:<port>` - Perform BitTorrent handshake with a peer
+- `download_piece -o <output_path> <torrent_file> <piece_index>` - Download a single piece from peers
 
 ### Key Functions
 
@@ -69,3 +70,9 @@ BitTorrent client implementation. Single-file architecture in `src/main.cpp` wit
 - `sha1_hash()` / `sha1_hash_raw()` - SHA1 hashing (hex string vs raw bytes)
 - `fetch_url()` - HTTP GET using libcurl
 - `perform_handshake()` - TCP socket connection and BitTorrent protocol handshake
+- `download_piece()` - Download and verify a piece using block requests (16KB blocks)
+- `send_message()` / `recv_message()` - BitTorrent peer wire protocol message framing
+
+### BitTorrent Protocol Constants
+
+Message IDs follow BEP 0003: `MSG_CHOKE (0)`, `MSG_UNCHOKE (1)`, `MSG_INTERESTED (2)`, `MSG_NOT_INTERESTED (3)`, `MSG_BITFIELD (5)`, `MSG_REQUEST (6)`, `MSG_PIECE (7)`. Block size is 16KB (2^14).
