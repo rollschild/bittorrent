@@ -693,6 +693,72 @@ int main(int argc, char* argv[]) {
         std::ofstream out(output_path, std::ios::binary);
         out.write(file_data.c_str(), file_data.size());
         out.close();
+    } else if (command == "magnet_parse") {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0]
+                      << " magnet_parse -o <magnet-link>" << std::endl;
+            return 1;
+        }
+
+        std::string magnet_link = argv[2];
+
+        // magnet link format:
+        // `magnet:?xt=urn:btih:<info-hash>&dn=<name>&tr=<tracker-url>&x.pe=<peer-address>`
+        std::string info_hash;
+        std::string tracker_url;
+
+        // parse query parameters
+        size_t query_start = magnet_link.find('?');
+        if (query_start == std::string::npos) {
+            std::cerr << "INVALID magnet link format!" << std::endl;
+            return 1;
+        }
+
+        std::string query = magnet_link.substr(query_start + 1);
+        // split by '&' and parse each parameter
+        size_t pos = 0;
+        while (pos < query.length()) {
+            size_t amp_pos = query.find('&', pos);
+            std::string param;
+            if (amp_pos == std::string::npos) {
+                param = query.substr(pos);
+                pos = query.length();
+            } else {
+                param = query.substr(pos, amp_pos - pos);
+                pos = amp_pos + 1;
+            }
+
+            size_t eq_pos = param.find('=');
+            if (eq_pos != std::string::npos) {
+                std::string key = param.substr(0, eq_pos);
+                std::string value = param.substr(eq_pos + 1);
+
+                if (key == "xt" && value.substr(0, 9) == "urn:btih:") {
+                    // extract info hash
+                    info_hash = value.substr(9);
+                } else if (key == "tr") {
+                    // URL-encoded the tracker URL
+                    std::string decoded;
+                    for (size_t i = 0; i < value.length(); ++i) {
+                        if (value[i] == '%' && i + 2 < value.length()) {
+                            int hex_val;
+                            std::istringstream iss(value.substr(i + 1, 2));
+                            iss >> std::hex >> hex_val;
+                            decoded += static_cast<char>(hex_val);
+                            i += 2;
+
+                        } else {
+                            decoded += value[i];
+                        }
+                    }
+                    tracker_url = decoded;
+                }
+            }
+        }
+
+        std::cout << "Tracker URL: " << tracker_url << std::endl;
+        std::cout << "Info Hash: " << info_hash << std::endl;
+
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
