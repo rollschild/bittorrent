@@ -21,7 +21,7 @@ cmake --build build
 # Run
 ./build/src/main decode <encoded_value>
 
-# Run tests (GTest)
+# Run tests (GTest) - Note: tests directory currently commented out in CMakeLists.txt
 cmake --build build
 ctest --test-dir build
 
@@ -62,14 +62,19 @@ BitTorrent client implementation. Single-file architecture in `src/main.cpp` wit
 - `peers <torrent_file>` - Fetch and display peer list from tracker
 - `handshake <torrent_file> <ip>:<port>` - Perform BitTorrent handshake with a peer
 - `download_piece -o <output_path> <torrent_file> <piece_index>` - Download a single piece from peers
+- `download -o <output_path> <torrent_file>` - Download complete file from peers
+- `magnet_parse <magnet_link>` - Parse magnet link and extract tracker URL and info hash
 
 ### Key Functions
 
 - `decode_bencoded_value()` - Recursive bencode parser (strings, integers, lists, dicts)
 - `extract_bencoded_value()` - Extract raw bencoded data for a dictionary key (used for info hash)
 - `sha1_hash()` / `sha1_hash_raw()` - SHA1 hashing (hex string vs raw bytes)
+- `url_encode()` - URL-encode binary data for tracker requests
 - `fetch_url()` - HTTP GET using libcurl
+- `get_first_peer()` - Fetch peer list from tracker and return first peer's IP/port
 - `perform_handshake()` - TCP socket connection and BitTorrent protocol handshake
+- `wait_for_unchoke()` - Wait for bitfield, send interested, wait for unchoke message
 - `download_piece()` - Download and verify a piece using block requests (16KB blocks)
 - `send_message()` / `recv_message()` - BitTorrent peer wire protocol message framing
 

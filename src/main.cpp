@@ -17,6 +17,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -405,6 +406,107 @@ std::pair<std::string, int> get_first_peer(const json& torrent,
                      std::to_string(ip3) + "." + std::to_string(ip4);
     return {ip, port};
 }
+std::pair<std::string, int> get_first_peer(const std::string& tracker_url,
+                                           const std::string& info_hash_raw) {
+    std::string peer_id = "00112233445566778899";
+
+    std::string url = tracker_url + "?info_hash=" + url_encode(info_hash_raw) +
+                      "&peer_id=" + peer_id + "&port=6881" + "&uploaded=0" +
+                      "&downloaded=0" + "&left=999" + "&compact=1";
+
+    std::string res = fetch_url(url);
+    size_t idx = 0;
+    json tracker_res = decode_bencoded_value(res, idx);
+    // parse compact peers (6 bytes each: 4 IP + 2 port)
+    std::string peers = tracker_res["peers"].get<std::string>();
+    int ip1 = static_cast<unsigned char>(peers[0]);
+    int ip2 = static_cast<unsigned char>(peers[1]);
+    int ip3 = static_cast<unsigned char>(peers[2]);
+    int ip4 = static_cast<unsigned char>(peers[3]);
+    int port = (static_cast<unsigned char>(peers[4]) << 8 |
+                static_cast<unsigned char>(peers[5]));
+
+    std::string ip = std::to_string(ip1) + "." + std::to_string(ip2) + "." +
+                     std::to_string(ip3) + "." + std::to_string(ip4);
+    return {ip, port};
+}
+
+struct magnet_link {
+    // magnet link format:
+    // `magnet:?xt=urn:btih:<info-hash>&dn=<name>&tr=<tracker-url>&x.pe=<peer-address>`
+    std::string info_hash_hex;
+    std::string info_hash_raw;
+    std::string tracker_url;
+    std::string peer_addr_str;
+
+    void info_hash_hex_to_raw() {
+        if (!info_hash_hex.empty()) {
+            for (size_t i = 0; i < info_hash_hex.length(); i += 2) {
+                int byte_val;
+                std::istringstream iss(info_hash_hex.substr(i, 2));
+                iss >> std::hex >> byte_val;
+                info_hash_raw += static_cast<char>(byte_val);
+            }
+        }
+    }
+};
+
+magnet_link parse_magnet_link(std::string mag_link_str) {
+    magnet_link mag_link_struct;
+
+    // parse query parameters
+    size_t query_start = mag_link_str.find('?');
+    if (query_start == std::string::npos) {
+        throw std::runtime_error("INVALID magnet link format!");
+    }
+
+    std::string query = mag_link_str.substr(query_start + 1);
+    // split by '&' and parse each parameter
+    size_t pos = 0;
+    while (pos < query.length()) {
+        size_t amp_pos = query.find('&', pos);
+        std::string param;
+        if (amp_pos == std::string::npos) {
+            param = query.substr(pos);
+            pos = query.length();
+        } else {
+            param = query.substr(pos, amp_pos - pos);
+            pos = amp_pos + 1;
+        }
+
+        size_t eq_pos = param.find('=');
+        if (eq_pos != std::string::npos) {
+            std::string key = param.substr(0, eq_pos);
+            std::string value = param.substr(eq_pos + 1);
+
+            if (key == "xt" && value.substr(0, 9) == "urn:btih:") {
+                // extract info hash
+                mag_link_struct.info_hash_hex = value.substr(9);
+            } else if (key == "tr") {
+                // URL-encoded the tracker URL
+                std::string decoded;
+                for (size_t i = 0; i < value.length(); ++i) {
+                    if (value[i] == '%' && i + 2 < value.length()) {
+                        int hex_val;
+                        std::istringstream iss(value.substr(i + 1, 2));
+                        iss >> std::hex >> hex_val;
+                        decoded += static_cast<char>(hex_val);
+                        i += 2;
+                    } else {
+                        decoded += value[i];
+                    }
+                }
+                mag_link_struct.tracker_url = decoded;
+            } else if (key == "x.pe") {
+                mag_link_struct.peer_addr_str = value;
+            }
+        }
+    }
+
+    mag_link_struct.info_hash_hex_to_raw();
+
+    return mag_link_struct;
+}
 
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
@@ -700,65 +802,147 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::string magnet_link = argv[2];
+        std::string mag_link_str = argv[2];
+        magnet_link mag_link_struct = parse_magnet_link(mag_link_str);
 
-        // magnet link format:
-        // `magnet:?xt=urn:btih:<info-hash>&dn=<name>&tr=<tracker-url>&x.pe=<peer-address>`
-        std::string info_hash;
-        std::string tracker_url;
+        std::cout << "Tracker URL: " << mag_link_struct.tracker_url
+                  << std::endl;
+        std::cout << "Info Hash: " << mag_link_struct.info_hash_hex
+                  << std::endl;
 
-        // parse query parameters
-        size_t query_start = magnet_link.find('?');
-        if (query_start == std::string::npos) {
-            std::cerr << "INVALID magnet link format!" << std::endl;
+    } else if (command == "magnet_handshake") {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0]
+                      << " magnet_handshake <magnet-link>" << std::endl;
             return 1;
         }
 
-        std::string query = magnet_link.substr(query_start + 1);
-        // split by '&' and parse each parameter
-        size_t pos = 0;
-        while (pos < query.length()) {
-            size_t amp_pos = query.find('&', pos);
-            std::string param;
-            if (amp_pos == std::string::npos) {
-                param = query.substr(pos);
-                pos = query.length();
-            } else {
-                param = query.substr(pos, amp_pos - pos);
-                pos = amp_pos + 1;
+        std::string mag_link_str = argv[2];
+        magnet_link mag_link_struct = parse_magnet_link(mag_link_str);
+
+        // parse peer address from x.pe parameter
+        std::string ip;
+        int port{};
+        if (mag_link_struct.peer_addr_str.empty()) {
+            std::tie(ip, port) = get_first_peer(mag_link_struct.tracker_url,
+                                                mag_link_struct.info_hash_raw);
+        } else {
+            size_t colon_pos = mag_link_struct.peer_addr_str.find(':');
+            if (colon_pos == std::string::npos) {
+                throw std::runtime_error(
+                    "Invalid peer address in magnet link!");
             }
 
-            size_t eq_pos = param.find('=');
-            if (eq_pos != std::string::npos) {
-                std::string key = param.substr(0, eq_pos);
-                std::string value = param.substr(eq_pos + 1);
+            ip = mag_link_struct.peer_addr_str.substr(0, colon_pos);
+            port =
+                std::stoi(mag_link_struct.peer_addr_str.substr(colon_pos + 1));
+        }
 
-                if (key == "xt" && value.substr(0, 9) == "urn:btih:") {
-                    // extract info hash
-                    info_hash = value.substr(9);
-                } else if (key == "tr") {
-                    // URL-encoded the tracker URL
-                    std::string decoded;
-                    for (size_t i = 0; i < value.length(); ++i) {
-                        if (value[i] == '%' && i + 2 < value.length()) {
-                            int hex_val;
-                            std::istringstream iss(value.substr(i + 1, 2));
-                            iss >> std::hex >> hex_val;
-                            decoded += static_cast<char>(hex_val);
-                            i += 2;
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            throw std::runtime_error("Failed to create socket!");
+        }
 
-                        } else {
-                            decoded += value[i];
+        struct sockaddr_in peer_addr{};
+        peer_addr.sin_family = AF_INET;
+        peer_addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip.c_str(), &peer_addr.sin_addr);
+
+        if (connect(sock, reinterpret_cast<sockaddr*>(&peer_addr),
+                    sizeof(peer_addr)) < 0) {
+            close(sock);
+            throw std::runtime_error("Failed to connect to peer!");
+        }
+
+        // build handshake with extension support
+        // reserved byte 5, bit 4 (0x10) indeicates extension protocol support
+        // 00 00 00 00 00 10 00 00
+        std::string reserved(8, '\0');
+        reserved[5] = 0x10;
+
+        std::string peer_id = "00112233445566778899";
+        std::string handshake;
+        handshake += static_cast<char>(19);          // protocl len
+        handshake += "BitTorrent protocol";          // 19 bytes
+        handshake += reserved;                       // reserved bytes
+        handshake += mag_link_struct.info_hash_raw;  // 20 bytes
+        handshake += peer_id;                        // 20 bytes
+
+        // send handshake
+        if (send(sock, handshake.c_str(), handshake.length(), 0) !=
+            static_cast<ssize_t>(handshake.length())) {
+            close(sock);
+            throw std::runtime_error("Failed to send handshake!");
+        }
+
+        // receive peer's handshake
+        char response[68];
+        recv_all(sock, response, 68);
+
+        // extract and print peer ID
+        std::string rcvd_peer_id(response + 48, 20);
+        std::cout << "Peer ID: ";
+        for (unsigned char c : rcvd_peer_id) {
+            std::cout << std::hex << std::setfill('0') << std::setw(2)
+                      << static_cast<int>(c);
+        }
+        std::cout << std::endl;
+
+        // check if peer supports extensions
+        bool peer_supports_extensions =
+            (static_cast<unsigned char>(response[25]) & 0x10) != 0;
+        if (peer_supports_extensions) {
+            // send extension handshake (BEP 10)
+            // message ID 20 = extended;
+            // extended ID 0 = handshake
+            // payload: bencoded dict with "m" containing supported extensions
+            // we advertise support for `ut_metadata` (BEP 9) with ID 1
+            std::string ext_handshake_payload = "d1:md11:ut_metadatai1eee";
+
+            // build extended message:
+            //   - msg_id (20)
+            //   - ext_id (0)
+            //   - payload
+            std::string ext_msg;
+            ext_msg +=
+                static_cast<char>(0);  // extended message ID 0 = handshake
+            ext_msg += ext_handshake_payload;
+
+            // send as message with ID 20
+            constexpr uint8_t MSG_EXTENDED = 20;
+            send_message(sock, MSG_EXTENDED, ext_msg);
+
+            // receive messages until we get the extension handshake
+            // peer might send bitfield or other messages first
+            while (true) {
+                // receive peer's extension handshake
+                auto [msg_id, payload] = recv_message(sock);
+                if (msg_id == MSG_EXTENDED && !payload.empty()) {
+                    uint8_t ext_msg_id = static_cast<uint8_t>(payload[0]);
+
+                    if (ext_msg_id == 0) {
+                        // extension handshake received
+                        std::string ext_payload = payload.substr(1);
+                        size_t idx = 0;
+                        json ext_dict = decode_bencoded_value(ext_payload, idx);
+
+                        // print peer metadata extension ID if available
+                        if (ext_dict.contains("m") &&
+                            ext_dict["m"].contains("ut_metadata")) {
+                            std::cout << std::dec
+                                      <<  // reset to decimal mode since hex
+                                          // mode is sticky!
+                                "Peer Metadata Extension ID: "
+                                      << ext_dict["m"]["ut_metadata"].get<int>()
+                                      << std::endl;
                         }
+                        break;
                     }
-                    tracker_url = decoded;
                 }
             }
         }
 
-        std::cout << "Tracker URL: " << tracker_url << std::endl;
-        std::cout << "Info Hash: " << info_hash << std::endl;
-
+        close(sock);
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
