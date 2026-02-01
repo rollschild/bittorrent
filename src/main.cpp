@@ -943,6 +943,240 @@ int main(int argc, char* argv[]) {
         }
 
         close(sock);
+    } else if (command == "magnet_info") {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0] << " magnet_info <magnet-link>"
+                      << std::endl;
+            return 1;
+        }
+
+        std::string mag_link_str = argv[2];
+        magnet_link mag_link_struct = parse_magnet_link(mag_link_str);
+
+        // parse peer address from x.pe parameter
+        std::string ip;
+        int port{};
+        if (mag_link_struct.peer_addr_str.empty()) {
+            std::tie(ip, port) = get_first_peer(mag_link_struct.tracker_url,
+                                                mag_link_struct.info_hash_raw);
+        } else {
+            size_t colon_pos = mag_link_struct.peer_addr_str.find(':');
+            if (colon_pos == std::string::npos) {
+                throw std::runtime_error(
+                    "Invalid peer address in magnet link!");
+            }
+
+            ip = mag_link_struct.peer_addr_str.substr(0, colon_pos);
+            port =
+                std::stoi(mag_link_struct.peer_addr_str.substr(colon_pos + 1));
+        }
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            throw std::runtime_error("Failed to create socket!");
+        }
+
+        struct sockaddr_in peer_addr{};
+        peer_addr.sin_family = AF_INET;
+        peer_addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip.c_str(), &peer_addr.sin_addr);
+
+        if (connect(sock, reinterpret_cast<sockaddr*>(&peer_addr),
+                    sizeof(peer_addr)) < 0) {
+            close(sock);
+            throw std::runtime_error("Failed to connect to peer!");
+        }
+
+        // build handshake with extension support
+        // reserved byte 5, bit 4 (0x10) indeicates extension protocol support
+        // 00 00 00 00 00 10 00 00
+        std::string reserved(8, '\0');
+        reserved[5] = 0x10;
+
+        std::string peer_id = "00112233445566778899";
+        std::string handshake;
+        handshake += static_cast<char>(19);          // protocl len
+        handshake += "BitTorrent protocol";          // 19 bytes
+        handshake += reserved;                       // reserved bytes
+        handshake += mag_link_struct.info_hash_raw;  // 20 bytes
+        handshake += peer_id;                        // 20 bytes
+
+        // send handshake
+        if (send(sock, handshake.c_str(), handshake.length(), 0) !=
+            static_cast<ssize_t>(handshake.length())) {
+            close(sock);
+            throw std::runtime_error("Failed to send handshake!");
+        }
+
+        // receive peer's handshake
+        char response[68];
+        recv_all(sock, response, 68);
+
+        // check if peer supports extensions
+        bool peer_supports_extensions =
+            (static_cast<unsigned char>(response[25]) & 0x10) != 0;
+        if (!peer_supports_extensions) {
+            close(sock);
+            std::cerr << "Peer does not support extensions!" << std::endl;
+            return 0;
+        }
+        // send extension handshake (BEP 10)
+        // message ID 20 = extended;
+        // extended ID 0 = handshake
+        // payload: bencoded dict with "m" containing supported extensions
+        // we advertise support for `ut_metadata` (BEP 9) with ID 1
+        std::string ext_handshake_payload = "d1:md11:ut_metadatai1eee";
+
+        // build extended message:
+        //   - msg_id (20)
+        //   - ext_id (0)
+        //   - payload
+        std::string ext_msg;
+        ext_msg += static_cast<char>(0);  // extended message ID 0 = handshake
+        ext_msg += ext_handshake_payload;
+
+        // send as message with ID 20
+        constexpr uint8_t MSG_EXTENDED = 20;
+        send_message(sock, MSG_EXTENDED, ext_msg);
+
+        int peer_metadata_id = 0;
+        int metadata_size = 0;
+
+        // receive messages until we get the extension handshake
+        // peer might send bitfield or other messages first
+        while (true) {
+            // receive peer's extension handshake
+            auto [msg_id, payload] = recv_message(sock);
+
+            // handle bitfield message
+            if (msg_id == MSG_BITFIELD) {
+                continue;
+            }
+
+            if (msg_id == MSG_EXTENDED && !payload.empty()) {
+                uint8_t ext_msg_id = static_cast<uint8_t>(payload[0]);
+
+                if (ext_msg_id == 0) {
+                    // extension handshake received
+                    std::string ext_payload = payload.substr(1);
+                    size_t idx = 0;
+                    json ext_dict = decode_bencoded_value(ext_payload, idx);
+
+                    // print peer metadata extension ID if available
+                    if (ext_dict.contains("m") &&
+                        ext_dict["m"].contains("ut_metadata")) {
+                        peer_metadata_id =
+                            ext_dict["m"]["ut_metadata"].get<int>();
+                    }
+                    // not inside the "m" dict
+                    if (ext_dict.contains("metadata_size")) {
+                        metadata_size = ext_dict["metadata_size"].get<int>();
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (peer_metadata_id == 0 || metadata_size == 0) {
+            close(sock);
+            std::cerr << "Peer does not support metadata extension!"
+                      << std::endl;
+            return 0;
+        }
+
+        // request metadata pieces
+        // metadata split into 16KB pieces
+        int num_piece = (metadata_size + 16384 - 1) / 16384;
+        std::string metadata;
+        metadata.reserve(metadata_size);
+        for (int piece = 0; piece < num_piece; ++piece) {
+            // send metadata request: d8:msg_typei0e5:piecei<piece>ee
+            // {'msg_type': 0, 'piece': 0}
+            std::string request_payload =
+                "d8:msg_typei0e5:piecei" + std::to_string(piece) + "ee";
+            std::string request_msg;
+            // extension message id (1 byte)
+            // This will be the peer's metadata extension ID, which you received
+            // during the extension handshake
+            request_msg += static_cast<char>(peer_metadata_id);
+            request_msg += request_payload;
+            send_message(sock, MSG_EXTENDED, request_msg);
+
+            // receive metadata response
+            while (true) {
+                auto [msg_id, payload] = recv_message(sock);
+                if (msg_id == MSG_BITFIELD) {
+                    continue;
+                }
+
+                if (msg_id == MSG_EXTENDED && !payload.empty()) {
+                    uint8_t ext_msg_id = static_cast<uint8_t>(payload[0]);
+                    // our advertised ut_metadata ID is 1
+                    if (ext_msg_id == 1) {
+                        // parse bencoded header to find where data start
+                        std::string ext_payload = payload.substr(1);
+                        size_t idx = 0;
+                        json response_dict =
+                            decode_bencoded_value(ext_payload, idx);
+                        int msg_type = response_dict["msg_type"].get<int>();
+
+                        if (msg_type == 1) {
+                            // data
+                            // data follows the bencoded dict
+                            std::string piece_data = ext_payload.substr(idx);
+                            metadata += piece_data;
+                            break;
+                        } else if (msg_type == 2) {
+                            // reject
+                            close(sock);
+                            throw std::runtime_error(
+                                "Metadata request rejected!");
+                        }
+                    }
+                }
+            }
+        }
+
+        close(sock);
+
+        // verify metadata hash
+        std::string computed_hash = sha1_hash_raw(metadata);
+        if (computed_hash != mag_link_struct.info_hash_raw) {
+            throw std::runtime_error("Metadata hash mismatch!");
+        }
+
+        // parse info dictionary
+        size_t idx = 0;
+        json info = decode_bencoded_value(metadata, idx);
+
+        // print results
+        std::cout << "Tracker URL: " << mag_link_struct.tracker_url
+                  << std::endl;
+        std::cout << "Length: " << info["length"].get<int64_t>() << std::endl;
+        std::cout << "Info Hash: " << mag_link_struct.info_hash_hex
+                  << std::endl;
+        std::cout << "Piece Length: " << info["piece length"].get<int64_t>()
+                  << std::endl;
+        std::cout << "Piece Hashes: " << std::endl;
+
+        auto pieces = info["pieces"].get<std::string>();
+        for (size_t i = 0; i < pieces.length(); i += 20) {
+            std::ostringstream ss;
+            for (size_t j = 0; j < 20; ++j) {
+                ss << std::hex << std::setfill('0') << std::setw(2)
+                   << static_cast<int>(
+                          static_cast<unsigned char>(pieces[i + j]));
+                // pieces[i + j] is a char, which is signed on most platforms.
+                // a byte like 0xAB is stored as -85 in signed char.
+                // when you cast a signed char directly to int, sign extension
+                // occurs -85 (0xAB) becomes -85 or 0xFFFFFFAB.
+                // then std::cout << std::hex would print ffffffab instead of ab
+                // outer cast to int is needed because std::cout << std::hex
+                // would print an unsigned char as a character, not as a hex
+                // number
+            }
+            std::cout << ss.str() << std::endl;
+        }
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
