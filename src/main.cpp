@@ -214,6 +214,18 @@ void recv_all(int sock, void* buf, size_t len) {
     }
 }
 
+[[maybe_unused]]
+void send_all(int sock, const void* buf, size_t len) {
+    size_t sent = 0;
+    const char* p = static_cast<const char*>(buf);
+    while (sent < len) {
+        ssize_t n = send(sock, p + sent, len - sent, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) throw std::runtime_error("send failed!");
+        sent += static_cast<size_t>(n);
+    }
+}
+
 int perform_handshake(const std::string& ip, int port,
                       const std::string& info_hash, const std::string& peer_id,
                       bool keep_open = false) {
@@ -362,6 +374,9 @@ std::string download_piece(int sock, int piece_index, int piece_len,
             // payload.data() is char*
             // reinterpret_cast works with pointers _ONLY_
             // then dereference uint32_t* to uint32_t
+            if (payload.size() < 8) {
+                throw std::runtime_error("Invalid piece payload!");
+            }
             uint32_t begin =
                 ntohl(*reinterpret_cast<const uint32_t*>(payload.data() + 4));
             std::memcpy(piece_data.data() + begin, payload.data() + 8,
